@@ -29,7 +29,8 @@ CHUNK_SIZE = 5000
 plots = {"None":"None",
          "Visitor country":"visitor_country",
          "Visitor continent":"visitor_continent",
-         "Visitor browser":"visitor_browser"}
+         "Visitor browser":"visitor_browser",
+         "Visitor platform":"visitor_platform"}
 
 if sys.platform == 'linux':
     from subprocess import call
@@ -86,7 +87,6 @@ class Gui:
         self.progressbar2 = ttk.Progressbar(self.root, mode='determinate', variable=self.pg2_val)
         self.progressbar2.grid(column=2, row=5, columnspan=2, sticky='nsew')
 
-        
     def file_loaded_cb(self):
         self.ready_lb.config(bg="green")
         self.dropdown.config(state="normal")
@@ -112,6 +112,7 @@ class Gui:
       
     def plot(self, var):
         threshold = 0
+        
         self.mpl_fig.clf()
         self.mpl_ax = self.mpl_fig.add_subplot(111)
         
@@ -137,25 +138,6 @@ class Gui:
         self.canvas.draw()
  
  
-class DummyFile(object):
-  file = None
-  def __init__(self, file):
-    self.file = file
-
-  def write(self, x):
-    print(x)
-    # Avoid print() second call (useless \n)
-    if len(x.rstrip()) > 0:
-        tqdm.write(x, file=self.file)
-        
-        
-@contextlib.contextmanager
-def nostdout():
-    save_stdout = sys.stdout
-    sys.stdout = DummyFile(sys.stdout)
-    yield
-    sys.stdout = save_stdout
-                   
 class Model:
     def __init__(self, root):
         self.root = root
@@ -203,39 +185,75 @@ class Model:
             return 'None'
             
     def add_column(self, var):
-        if var == 'visitor_continent' and var not in list(self.data.columns):
-            self.data['visitor_continent'] = self.data['visitor_country'].apply(self.country_to_continent)
-            
-        elif var == 'visitor_browser' and var not in list(self.data.columns):
-            thread = threading.Thread(target=self.preprocess_browser) # Could use args parameter
+        if var not in list(self.data.columns):
+            thread = threading.Thread(target=self.preprocess, args=(var,)) 
             thread.daemon = True
             thread.start()
             return False
-            
-        elif var == 'visitor_plateform' and var not in list(self.data.columns):
-            self.data['visitor_plateform'] = self.data['visitor_useragent'].apply(lambda x: 'Mobile' if ua.parse(x).is_mobile else 'Desktop')
         
-        return True
+        else:
+            return True
         
-    def preprocess_browser(self):
-        i = 1
+    def preprocess(self, var):
         start_time = time.time() 
         self.gui.progressbar2["maximum"] = 100
-        print("started")
         df_len = len(self.data.index)
-        #[i:max(int((i+1)*df_len/10), df_len-1)]
-        split = np.array_split(self.data, 100)
-        print("split done")
+        split = np.array_split(self.data, 100) # Data is not copied, no ram increase !
+           
+        self.data[var] = np.nan
+        for df, i in zip(split, range(1,101)):
+            if var == 'visitor_browser':
+                self._preprocess_browser(df)
+            elif var == 'visitor_platform':
+                self._preprocess_platform(df)
+            
+            self.gui.pg2_val.set(i)  
+        self.data = pd.concat(split)
+         
+        print(f"Done preprocessing - {time.time()- start_time} sec")
         
-        #self.data['visitor_browser'] = self.data['visitor_useragent'].apply(lambda x: ua.parse(x).browser.family)
-        for df in split:
+        
+        
+    def _preprocess_browser(self, df):
+        df['visitor_browser'] = df['visitor_useragent'].apply(lambda x: ua.parse(x).browser.family)      
+        
+    def _preprocess_platform(self, df):
+        df['visitor_platform'] = df['visitor_useragent'].apply(lambda x: 'Mobile' if ua.parse(x).is_mobile else 'Desktop')        
+            
+            
+            
+    """def preprocess_browser(self):
+        start_time = time.time() 
+        self.gui.progressbar2["maximum"] = 100
+        df_len = len(self.data.index)
+        split = np.array_split(self.data, 100) # Data is not copied, no ram increase !
+
+        self.data['visitor_browser'] = np.nan
+        for df, i in zip(split, range(1,101)):
             df['visitor_browser'] = df['visitor_useragent'].apply(lambda x: ua.parse(x).browser.family)
             self.gui.pg2_val.set(i)
-            i+=1
         
         self.data = pd.concat(split)
          
         print(f"Done preprocessing - {time.time()- start_time} sec")
+        
+    
+    def preprocess_platform(self):
+        start_time = time.time() 
+        self.gui.progressbar2["maximum"] = 100
+        df_len = len(self.data.index)
+        split = np.array_split(self.data, 100) # Data is not copied, no ram increase !
+
+        self.data['visitor_platform'] = np.nan
+        for df, i in zip(split, range(1,101)):
+            df['visitor_platform'] = df['visitor_useragent'].apply(lambda x: 'Mobile' if ua.parse(x).is_mobile else 'Desktop')        
+            self.gui.pg2_val.set(i)
+        
+        self.data = pd.concat(split)
+         
+        print(f"Done preprocessing - {time.time()- start_time} sec")"""
+        
+        
 class DataAnalyser:
     def __init__(self):
         root = tk.Tk()
