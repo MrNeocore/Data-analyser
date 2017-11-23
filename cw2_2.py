@@ -1,11 +1,3 @@
-from matplotlib import style, use
-use("TkAgg")
-import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2TkAgg
-import matplotlib.ticker as ticker
-
-import json
 import numpy as np
 import pandas as pd
 import user_agents as ua
@@ -16,20 +8,20 @@ from tkinter import ttk
 
 from itertools import takewhile, repeat, chain
 import threading, time
-import psutil, os, sys, random
-from subprocess import run, PIPE
+import sys, random
 from tqdm import tqdm, tqdm_pandas
-import contextlib
-import collections
-import heapq
-import operator
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2TkAgg
+import matplotlib.ticker as ticker
+from matplotlib import style, use
+use("TkAgg")
+import matplotlib.pyplot as plt
+import argparse
 
 style.use('ggplot')
 plt.ion()
 CHUNK_SIZE = 5000
-
-
-######### USE READ EVENTS
 
 
 plots = {"None":"None",
@@ -39,7 +31,7 @@ plots = {"None":"None",
          "Visitor platform":"visitor_platform"}
 
 if sys.platform == 'linux':
-    from subprocess import call
+    from subprocess import run, PIPE
     def line_count(filename):
         print("Counting lines in file (*nix)...")
         lines = int(run(["wc", "-l", filename], stdout=PIPE).stdout.decode('utf-8').split(" ")[0])
@@ -48,7 +40,7 @@ if sys.platform == 'linux':
         return lines
 else:   
     # Fastest pure python implementation found
-    # Inspired by "Quentin Pradet"'s answer at https://stackoverflow.com/questions/845058/how-to-get-line-count-cheaply-in-python (7th post)
+    # Inspired by Quentin Pradet's answer at https://stackoverflow.com/questions/845058/how-to-get-line-count-cheaply-in-python (7th post)
     def line_count(filename):
         print("Counting lines in file...")
         fd = open(filename, 'rb')
@@ -59,9 +51,34 @@ else:
         
         return lines
 
+class Sorting:
+    @staticmethod
+    def freq_ascending_sort(data): # Data as : [('<DOC_ID>', <count>), ('<DOC_ID>', <count>)...], returns ['<DOC_ID>', '<DOC_ID>'...]
+        return data.reverse() # Data sorted (max -> min) by Counter
+        
+    @staticmethod 
+    def freq_descending_sort(data):
+        return data # Data already sorted (max -> min) by Counter
+    
+    @staticmethod
+    def biased_sort(data): # Data : JSON encoded strings {"doc":"<DOC_ID>", "weight":"<weight>"} (1 per line)
+        doc_weights = {}
+        with open("doc_weights.csv") as f:
+            for line in f.readlines():
+                (doc_id, weight) = line.split(',')
+                doc_weights[doc_id] = int(weight)
+                            
+        sorted_docs = []
+        
+        for doc_id, freq in data:
+            sorted_docs.append((doc_id, doc_weights.get(doc_id, freq))) # If we have no bias toward this document, simply use its frequency
+        
+        sorted_docs =  sorted(sorted_docs, key=lambda x:x[1], reverse=True)
+        
+        return sorted_docs
+
 class Gui:
-    def __init__(self, model, root):
-        self.model = model
+    def __init__(self, root):
         self.root = root
         self.mainframe = ttk.Frame(self.root)
         self.mainframe.grid(column=2, row=4, sticky=("nswe"))
@@ -81,7 +98,7 @@ class Gui:
         variable = StringVar(self.root)
         variable.set(list(plots.keys())[0]) # default value
 
-        self.dropdown = tk.OptionMenu(self.root, variable, *list(plots.keys()), command=lambda x :self.plot(plots[x]))
+        self.dropdown = tk.OptionMenu(self.root, variable, *list(plots.keys()), command=lambda x :self.embed_plot(plots[x]))
         self.dropdown.grid(column=3, row=3)
         self.dropdown.config(state="disabled")
    
@@ -93,35 +110,16 @@ class Gui:
         self.progressbar2 = ttk.Progressbar(self.root, mode='determinate', variable=self.pg2_val)
         self.progressbar2.grid(column=2, row=5, columnspan=2, sticky='nsew')
         
-        button2 = ttk.Button(self.root, text="Get document readers", command=lambda : self._also_likes_rnd())#('232eeca785873d35')) 
-        button2.grid(column=3, row=3)
-
-    def freq_ascending_sort(self, data): # Data as : [('<DOC_ID>', <count>), ('<DOC_ID>', <count>)...], returns ['<DOC_ID>', '<DOC_ID>'...]
-        return data.reverse() # Data sorted (max -> min) by Counter
+        button2 = ttk.Button(self.root, text="Get document readers", command=lambda : self.model.also_likes('140228202800-6ef39a241f35301a9a42cd0ed21e5fb0', Sorting.freq_descending_sort, 'b2a24f14bb5c9ea3'))#('232eeca785873d35')) 
+        button2.grid(column=5, row=3)
     
+    def set_model(self, model):
+        self.model = model
+        
     def _also_likes_rnd(self):
         rnd = random.randrange(0,len(self.model.data))
         self.model.also_likes(self.model.data.iloc[rnd]['subject_doc_id'], self.freq_descending_sort, self.model.data.iloc[rnd]['visitor_uuid'])
-        
-    def freq_descending_sort(self, data):
-        return data # Data already sorted (max -> min) by Counter
     
-    def biased_sort(self, data): # Data : JSON encoded strings {"doc":"<DOC_ID>", "weight":"<weight>"} (1 per line)
-        doc_weights = {}
-        with open("doc_weights.csv") as f:
-            for line in f.readlines():
-                (doc_id, weight) = line.split(',')
-                doc_weights[doc_id] = int(weight)
-                            
-        sorted_docs = []
-        
-        for doc_id, freq in data:
-            sorted_docs.append((doc_id, doc_weights.get(doc_id, freq))) # If we have no bias toward this document, simply use its frequency
-        
-        sorted_docs =  sorted(sorted_docs, key=lambda x:x[1], reverse=True)
-        
-        return sorted_docs
-            
     def file_loaded_cb(self):
         self.ready_lb.config(bg="green")
         self.dropdown.config(state="normal")
@@ -145,77 +143,86 @@ class Gui:
         toolbar = NavigationToolbar2TkAgg(self.canvas, c)
         toolbar.update()
       
-    def plot(self, var):
+    def embed_plot(self, var):
         threshold = 0
         
         self.mpl_fig.clf()
         self.mpl_ax = self.mpl_fig.add_subplot(111)
-        
-        if var != "None" and self.model.add_column(var):
-            print(f"ploting {var}")
-            
-            df = self.model.data 
-            dfmi.loc[:,('one','second')]
-            df.loc[df['subject_doc_id'] == df.iloc[random.randrange(0,len(df))]['subject_doc_id']] #'130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb'] '130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb']
-            df.drop_duplicates(['visitor_uuid'], inplace=True)
-            
-            # Get sum on the given column and sort in descending order
-            df = df.groupby([var], as_index=False).size().reset_index(name='counts')
-            df = df.sort_values('counts', ascending=False)
-               
-            # Bar plot chart       
-            self.mpl_ax = df.plot.bar(var,'counts', ax=self.mpl_ax)
-            
-            # Change chart y ticks
-            #if num_y_ticks:
-            self.mpl_ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=20))#num_y_ticks))
-                
-            # Rotate chart x ticks
-            #self.mpl_fig.xticks(rotation=0)
-            
+        if var != None:# self.model.data.columns: # TODO : Call back done -> show graph if still on same page
+            #if not self.model.get_plot_data(var, random.randrange(0,len(self.model.data)), callback=self.plot_data_ready): # Async, yield to say processing has to be done ?
+             self.ready_lb.config(bg="red")
+             thread = threading.Thread(target=self.model.get_plot_data, args=(var,None, self.plot_data_ready)) # Thread creation is probably not worth it when preprocessing is already done
+             thread.start() 
+          
+    def plot_data_ready(self, data):
+        print("Plot data ready")
+        self.ready_lb.config(bg="green")
+        Plotting.plot(self.mpl_ax, data)
         self.canvas.draw()
- 
- 
+
+class Plotting:
+    @staticmethod
+    def plot(axes, data):
+        print(f"ploting {data.columns[0]}")
+        
+        # Bar plot chart       
+        axes = data.plot.bar(data.columns[0],'counts', ax=axes)
+        
+        # Change chart y ticks
+        #if num_y_ticks:
+        axes.yaxis.set_major_locator(ticker.MaxNLocator(nbins=20))#num_y_ticks))
+            
+        # Rotate chart x ticks
+        #self.mpl_fig.xticks(rotation=0)
+        
 class Model:
-    def __init__(self, root):
-        self.root = root
+    def __init__(self, iface):
+        self.iface = iface
+        
+        self.tk_gui= hasattr(self.iface, 'root') and isinstance(self.iface.root, tk.Tk)
+        
+        if self.tk_gui:
+            self.root = self.iface.root
+            self.done_loading = StringVar(self.root)
+            self.done_loading.trace_add("write", self.loading_done)
+            
         self.data = pd.DataFrame()
         self.country_codes = pd.read_csv("country_codes_simple_fixed.csv", na_filter = False)
-        self.done_loading = StringVar(self.root)
-        self.done_loading.trace_add("write", self.loading_done)
     
-    def set_gui(self, gui):
-        self.gui = gui
-        
     def loading_done(self, *args):
-        self.gui.file_loaded_cb()
+        self.iface.file_loaded_cb()
+        
         print("Loading finished !")
         
-    def load_main_file_async(self, filename, pg_val): 
+    def load_main_file_async(self, filename, pg_val=None): 
         thread = threading.Thread(target=lambda :self._load_file(filename, pg_val)) # Could use args parameter
         thread.daemon = True
         thread.start()
     
-    def _load_file(self, filepath, pg_val):
+    def _load_file(self, filepath, pg_val=None):
         print("Started loading file")
         self.data = pd.DataFrame()
         start_time = time.time()
         i = 1
         tmp = []
-        for df in pd.read_json(filepath, lines=True, chunksize=CHUNK_SIZE): 
+        
+        for df in tqdm(pd.read_json(filepath, lines=True, chunksize=CHUNK_SIZE), total=line_count(filepath)/CHUNK_SIZE): 
             df = df.loc[df['event_type'] == 'read']
             tmp.append(df[['visitor_uuid','visitor_country', 'visitor_useragent', 'subject_doc_id']])  
-            pg_val.set(i)
+            if self.tk_gui and pg_val is not None:
+                pg_val.set(i)
             i +=1
         
         self.data = pd.concat(tmp, axis=0)
-        self.data.drop_duplicates(['visitor_uuid', 'subject_doc_id'], inplace=True) # Also do it on each chunk to reduce each chunk size and speed up concatenation ? Mmm..
+        self.data.drop_duplicates(['visitor_uuid', 'subject_doc_id'], inplace=True)
         
-        self.done_loading.set(True)
-        print("Loading done")
+        if self.tk_gui and hasattr(self, 'done_loading') and isinstance(self.done_loading, StringVar):
+            self.done_loading.set(True)
+            
+        print("\nLoading done")
         df_mem_usage = self.data.memory_usage().sum()/(1024*1024)
         print(f"{time.time() - start_time} seconds, {df_mem_usage} MB")
-
+        
     def country_to_continent(self, country):
         continent_list = self.country_codes.loc[self.country_codes['a-2'] == country]['CC'].values
         
@@ -224,35 +231,63 @@ class Model:
         else:
             return 'None'
             
-    def add_column(self, var):
-        if var not in list(self.data.columns):
-            thread = threading.Thread(target=self.preprocess, args=(var,)) 
-            thread.daemon = True
-            thread.start()
-            return False
+    
+    
         
-        else:
-            return True
+    def get_plot_data(self, var, doc_id = None, callback=None):
+        #if not self.tk_gui:
+        #    self.add_column(var, blocking=True)
+        #else:
+        #    if self.add_column(var, blocking=False, callback=self.ttt):
+        #self.add_column(var, blocking=False, callback=self.col_ready)
+        self.preprocess(var)
+           
+        data = self.data.copy()  ### TODO : Find a way to not use it
         
+        if doc_id is not None: # If we are making a plot for a given document or a on the whole dataset
+            data.loc[data['subject_doc_id'] == doc_id]#data.iloc[doc_id]['subject_doc_id']] #'130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb'] '130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb']
+        
+        data.drop_duplicates(['visitor_uuid'], inplace=True)
+        assert(data is not self.data)
+        # Get sum on the given column and sort in descending order
+        data = data.groupby([var], as_index=False).size().reset_index(name='counts')
+        data = data.sort_values('counts', ascending=False)
+        
+        if callback is not None:
+            callback(data)
+
+    #def add_column(self, var, blocking=False, callback=None):
+    #    if var not in list(self.data.columns):
+    #        thread = threading.Thread(target=self.preprocess, args=(var,callback)) 
+    #        thread.start()
+            
     def preprocess(self, var):
         start_time = time.time() 
-        self.gui.progressbar2["maximum"] = 100
-        df_len = len(self.data.index)
+        if self.tk_gui and hasattr(self.iface, 'progressbar2'):
+            self.iface.progressbar2["maximum"] = 100
+            
         split = np.array_split(self.data, 100) # Data is not copied, no ram increase !
            
+        # TODO : use tqdm here
         self.data[var] = np.nan
-        for df, i in zip(split, range(1,101)):
+        for df, i in tqdm(zip(split, range(1,101))):
             if var == 'visitor_browser':
                 self._preprocess_browser(df)
             elif var == 'visitor_platform':
                 self._preprocess_platform(df)
-            
-            self.gui.pg2_val.set(i)  
+            elif var == 'visitor_continent':
+                self._preprocess_continent(df)
+                
+            if self.tk_gui:
+                self.iface.pg2_val.set(i)
         self.data = pd.concat(split)
-         
-        print(f"Done preprocessing - {time.time()- start_time} sec")
         
-            
+        print(f"Done preprocessing - {time.time()- start_time} sec")
+
+                
+    def _preprocess_continent(self, df):
+        df['visitor_continent'] = df['visitor_country'].apply(lambda x: self.country_to_continent(x))
+        
     def _preprocess_browser(self, df):
         df['visitor_browser'] = df['visitor_useragent'].apply(lambda x: ua.parse(x).browser.family)      
         
@@ -270,37 +305,46 @@ class Model:
      
     def also_likes(self, doc_id, sort, ori_reader = None):
         start = time.time()
-        docs = []
         dic = {}
-        #import pdb; pdb.set_trace()
         print(f"Original reader : {ori_reader}, original doc : {doc_id}")
         also_readers = self.get_document_readers(doc_id)
         print(f"readers of the same doc : {also_readers}")
        
         if ori_reader:
             also_readers.remove(ori_reader)  
-                    
-        for reader in self.get_document_readers(doc_id):
-            #if reader != ori_reader:
+        
+        dic[doc_id] = []
+        dic[doc_id].append(ori_reader)
+                   
+        for reader in also_readers:
+            good = False
             for doc in self.visitor_views(reader):
                 if doc not in dic:
                     dic[doc] = []
-                dic[doc].append(reader)
+                if doc != doc_id:
+                    good = True
+                    dic[doc].append(reader)
+            
+            if good:
+                dic[doc_id].append(reader)
            #docs.extend((reader, self.visitor_views(reader)))
         
-        #import pdb; pdb.set_trace()
-        #docs = collections.Counter(docs).most_common(10) # Optimized (tested vs dictionnary + sort + indexing and dictionnary + heapq.nlargest) 
-        #docs = sort(docs)
-        #docs = [x[0] for x in docs]
-        dot_graph = GraphBuilder().build_tree(doc_id, dic, ori_reader)
-        #print(dot_graph)
+        tmp = [(doc_id, len(readers)) for doc_id, readers in dic.items()]
+        sorted(tmp, key=lambda x:x[1])
+        tmp = tmp[0:10]
+        tmp = [x[0] for x in tmp]
+        
+        new_dic = {doc:readers for doc, readers in dic.items() if doc in tmp}
+
+        dot_graph = GraphBuilder().build_tree(doc_id, new_dic, ori_reader)
+        
         with open("my_diag.dot", "w") as f:
             f.write(dot_graph)
         
         print(f"Time : {time.time() - start} sec")
         
         print (dic)
-        #import pdb; pdb.set_trace()
+
         return dic
 
 class GraphBuilder:
@@ -308,7 +352,8 @@ class GraphBuilder:
                             "ranksep=.75; ratio=compress; size = \"15,22\"; orientation=landscape; rotate=180;",
                             "{",
                             "node [shape=plaintext, fontsize=16];",
-                            "Readers -> Documents "]
+                            "Readers -> Documents ",
+                            "[label=\"Size: 1m\"];"] # Not really part of the header, but this is done so that the label structure in the Graph class only contains real labels (docs/readers) 
                         
     def __init__(self, graph_header = None):
         if graph_header == None:
@@ -355,9 +400,9 @@ class GraphBuilder:
             self.graph.add_reader(reader)
             
     def add_ori(self, ori_doc, ori_reader):
-          self.graph.add_document(ori_doc, ori=True)
+          self.graph.add_document(ori_doc, pos="center", align_key="ori", ori=True)
           if ori_reader:
-            self.graph.add_reader(ori_reader, ori=True)
+            self.graph.add_reader(ori_reader, pos="center", align_key="ori", ori=True)
 
     def add_link(self, reader, doc):
         self.graph.add_link(reader, doc)
@@ -367,12 +412,13 @@ class Graph:
     def __init__(self, header, ori_design):
         self.header = header
         self.ori_design = ori_design
-        self.labels = ["[label=\"Size: 1m\"];"]
+        self.docs_labels = []
+        self.readers_labels = []
         self.readers = ["{ rank = same; \"Readers\";"]
         self.docs = ["{ rank = same; \"Documents\";"]
         self.links = []
     
-    def add_document(self, doc, align_key=-1, ori=False):
+    def add_document(self, doc, pos=None, align_key=None, ori=False):
         lb = f"\"{doc}\" [label=\"{doc}\", shape=\"circle\""
         if ori:
             lb += self.ori_design
@@ -380,9 +426,9 @@ class Graph:
         lb += "];"
         if f"\"{doc}\";" not in self.docs:
             self.docs.append(f"\"{doc}\";")
-            self.labels.append(lb)
+            self.docs_labels.append({'label':lb, 'align':align_key, 'pos':pos})
         
-    def add_reader(self, reader, align_key=-1, ori=False):
+    def add_reader(self, reader, pos=None, align_key=None, ori=False): # TODO : Use kwargs for align & ori
         lb = f"\"{reader}\" [label=\"{reader}\", shape=\"box\""
         if ori:
             lb += self.ori_design
@@ -390,62 +436,128 @@ class Graph:
         lb += "];"
         if f"\"{reader}\";" not in self.readers:
             self.readers.append(f"\"{reader}\";")
-            self.labels.append(lb)
+            self.readers_labels.append({'label':lb, 'align':align_key, 'pos':pos})
         
     def add_link(self, reader, doc):
         if f"\"{reader}\" -> \"{doc}\";" not in self.links:
             self.links.append(f"\"{reader}\" -> \"{doc}\";")
+        
+    def get_labels(self):
     
-    """def rearrange_order(self):
-        # Overly complicated way to find the original reader and document :)
-        tmp = list(filter(lambda x : "shape=\"box\",style=filled" in x, self.labels))
-        if len(tmp):
-            ori_reader = tmp[0]
-            
-        tmp = list(filter(lambda x : "shape=\"circle\",style=filled" in x, self.labels))
-        if len(tmp):
-            ori_doc = tmp[0]
-            
-        ori_reader_pos = int(len(self.readers) / 2)
-        ori_doc_pos = int(len(self.docs) / 2)
+        labels = []
+        right_readers   = [x['label'] for x in filter(lambda x : x['pos'] == 'right', self.readers_labels)]
+        center_readers  = [x['label'] for x in filter(lambda x : x['pos'] == 'center', self.readers_labels)]
+        left_readers    = [x['label'] for x in filter(lambda x : x['pos'] == 'left', self.readers_labels)]
+        other_readers   = [x['label'] for x in filter(lambda x : x['pos'] not in ('right', 'left', 'center'), self.readers_labels)]
         
-        new_docs = []
-        self.docs.remove(ori_doc)
+        other_readers_left  = other_readers[:int(len(other_readers)/2)]
+        other_readers_right = other_readers[int(len(other_readers)/2):]
         
-        for idx, doc in enumerate(self.docs):
-            if idx == ori_doc_pos:
-                new_docs.append(ori_doc)
-            new_docs.append(doc)
+        right_docs  = [x['label'] for x in filter(lambda x : x['pos'] == 'right', self.docs_labels)]
+        center_docs = [x['label'] for x in filter(lambda x : x['pos'] == 'center', self.docs_labels)]
+        left_docs   = [x['label'] for x in filter(lambda x : x['pos'] == 'left', self.docs_labels)]
+        other_docs  = [x['label'] for x in filter(lambda x : x['pos'] not in ('right', 'left', 'center'), self.docs_labels)]
         
-        new_readers = []
-        self.readers.remove(ori_reader)
+        other_docs_left  = other_docs[:int(len(other_docs)/2)]
+        other_docs_right = other_docs[int(len(other_docs)/2):]
         
-        for idx, reader in enumerate(self.readers):
-            if idx == ori_reader_pos:
-                new_readers.append(ori_reader)
-            new_docs.append(reader)
-    
-        self.docs = new_docs
-        self.readers = new_readers"""
+        readers = left_readers  +   other_readers_left  +   center_readers  +   other_readers_right +   right_readers
+        docs    = left_docs     +   other_docs_left     +   center_docs     +   other_docs_right    +   right_docs
+        
+        labels = readers + docs       
+        return labels
         
     def get_graph(self):
-        #self.rearrange_order()
+        # self.rearrange_order()
+        labels = self.get_labels()
         self.readers.append("};")
         self.docs.append("};")
         self.links.append("};")
-        graph = self.header + self.labels + self.readers + self.docs + self.links
+        graph = self.header + labels + self.readers + self.docs + self.links
         graph.append("}")
         graph = '\n'.join(graph)
         
         return graph
     
 class DataAnalyser:
-    def __init__(self):
-        root = tk.Tk()
-        self.model = Model(root)
-        self.gui = Gui(self.model, root)
-        self.model.set_gui(self.gui)
-        root.mainloop()
-    
+    def __init__(self, iface):
+        self.iface = iface
+        self.model = Model(self.iface)
+        self.iface.set_model(self.model)
 
-da = DataAnalyser()
+def arg_parser():
+    parser = argparse.ArgumentParser(description='Issuu data analytics software')
+
+    gui_group = parser.add_mutually_exclusive_group()
+    verbosity_group = parser.add_mutually_exclusive_group()
+
+
+    gui_group.add_argument('-g', '--gui', action='store_true',\
+                        help='Use the graphical user interface')
+
+    verbosity_group.add_argument("-v", "--verbose", action="count",\
+                        help="Increases verbosity, add 'v's for even more verbosity")
+
+    verbosity_group.add_argument("-q", "--quiet", action="store_true",\
+                        help="Do not output to stdout/stderr")
+
+    parser.add_argument("-t", "--task_id", action='store', #required=True, # Cannot since it is not mandatory when using gui -> Manual checking
+                        help="Task to execute")
+
+    parser.add_argument("-d", "--doc_uuid", action="store", #required=True,
+                        help="Document 'doc_uuid' to analyse")
+     
+    parser.add_argument("-f", "--input_file", action="store",# required=True,
+                        help='Issuu compliant input data file')
+
+    parser.add_argument("-o", "--output_file", action="store",\
+                        help='Output file to write to')
+
+    parser.add_argument("-u", "--user_uuid", action="store",\
+                        help='Issuu compliant input data file')
+
+    gui_group.add_argument("-plt", action="store_true",\
+                        help='Show plots (without gui)')
+
+    return parser
+
+class Cli:
+    def load_main_file(self, filename):
+        self.model._load_file(filename)
+        
+    def set_model(self, model):
+        self.model = model
+    
+    def get_plot_data(self, var, doc_id):
+        return self.model.get_plot_data(var, doc_id)#.to_string(index=False)
+        
+# Imports slow down cli - do something ?
+if __name__ == "__main__":
+    parser = arg_parser()
+    args = parser.parse_args()
+
+    v = args.verbose
+    if not args.quiet:
+        verbosity = (v or 0) +1 # Equivalent to 'x if x else 0' (coalescing operator) - right hand side used if x = [0, None, False, ""]
+    else:
+        verbosity = 0
+
+    print(verbosity)    
+    
+    if args.gui:
+        root = tk.Tk()
+        gui = Gui(root)
+        da = DataAnalyser(iface=gui)
+        root.mainloop()
+    else:
+        required_no_gui = args.task_id is not None and args.doc_uuid is not None and args.task_id is not None 
+
+        if not required_no_gui:
+            parser.error("the following arguments are required: -t/--task_id, -d/--doc_uuid, -f/--input_file when not using the gui (--gui)")
+
+        else:
+            cli = Cli()
+            da = DataAnalyser(iface=cli)
+            cli.load_main_file(args.input_file)
+            print(cli.get_plot_data('visitor_continent', '140206010823-b14c9d966be950314215c17923a04af7'))
+            input() 
