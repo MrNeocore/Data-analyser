@@ -18,6 +18,8 @@ from matplotlib import style, use
 use("TkAgg")
 import matplotlib.pyplot as plt
 import argparse
+import psutil
+import os
 
 style.use('ggplot')
 plt.ion()
@@ -95,10 +97,10 @@ class Gui:
         self.ready_lb = tk.Label(self.root, text="Ready", bg="red")
         self.ready_lb.grid(column=4, row =1)
  
-        variable = StringVar(self.root)
-        variable.set(list(plots.keys())[0]) # default value
+        self.drop_down_var = StringVar(self.root)
+        self.drop_down_var.set(list(plots.keys())[0]) # default value
 
-        self.dropdown = tk.OptionMenu(self.root, variable, *list(plots.keys()), command=lambda x :self.embed_plot(plots[x]))
+        self.dropdown = tk.OptionMenu(self.root, self.drop_down_var, *list(plots.keys()), command=lambda x :self.embed_plot(plots[x]))
         self.dropdown.grid(column=3, row=3)
         self.dropdown.config(state="disabled")
    
@@ -112,13 +114,23 @@ class Gui:
         
         button2 = ttk.Button(self.root, text="Get document readers", command=lambda : self.model.also_likes('140228202800-6ef39a241f35301a9a42cd0ed21e5fb0', Sorting.freq_descending_sort, 'b2a24f14bb5c9ea3'))#('232eeca785873d35')) 
         button2.grid(column=5, row=3)
-    
+        
+        self.res_usage = StringVar(self.root)
+        self.status_bar = tk.Label(self.root, text="Ram usage : ", textvariable=self.res_usage)
+        self.status_bar.grid(column=1,row=100, sticky='nswe')
+   
+
+    def refresh_res_label(self):
+        self.res_usage.set(self.model.res_usage())
+        self.root.after(1000, self.refresh_res_label)
+         
     def set_model(self, model):
         self.model = model
-        
+        self.refresh_res_label()
+
     def _also_likes_rnd(self):
         rnd = random.randrange(0,len(self.model.data))
-        self.model.also_likes(self.model.data.iloc[rnd]['subject_doc_id'], self.freq_descending_sort, self.model.data.iloc[rnd]['visitor_uuid'])
+        self.model.also_likes(self.model.data.iloc[rnd]['subject_doc_id'], Sorting.freq_descending_sort, self.model.data.iloc[rnd]['visitor_uuid'])
     
     def file_loaded_cb(self):
         self.ready_lb.config(bg="green")
@@ -126,7 +138,7 @@ class Gui:
         
     def load_main_file(self):
         filename = filedialog.askopenfile().name
-        self.progressbar["maximum"] = line_count(filename) / CHUNK_SIZE 
+        self.progressbar["maximum"] = int(line_count(filename) / CHUNK_SIZE)+1
         self.model.load_main_file_async(filename, self.pg_val)
     
     def show_graph(self):
@@ -137,7 +149,7 @@ class Gui:
         c.grid(column=1,row=99, columnspan=5)
         
         self.canvas = FigureCanvasTkAgg(self.mpl_fig, c)
-        self.canvas.get_tk_widget().grid(column=1, row=100)
+        self.canvas.get_tk_widget().grid(column=1, row=99)
         self.canvas.get_tk_widget().pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
         
         toolbar = NavigationToolbar2TkAgg(self.canvas, c)
@@ -148,17 +160,23 @@ class Gui:
         
         self.mpl_fig.clf()
         self.mpl_ax = self.mpl_fig.add_subplot(111)
-        if var != None:# self.model.data.columns: # TODO : Call back done -> show graph if still on same page
+        if var != 'None':# self.model.data.columns: # TODO : Call back done -> show graph if still on same page
             #if not self.model.get_plot_data(var, random.randrange(0,len(self.model.data)), callback=self.plot_data_ready): # Async, yield to say processing has to be done ?
              self.ready_lb.config(bg="red")
+             self.dropdown.config(state="disabled")
              thread = threading.Thread(target=self.model.get_plot_data, args=(var,None, self.plot_data_ready)) # Thread creation is probably not worth it when preprocessing is already done
              thread.start() 
+        else:
+            self.canvas.draw()
           
     def plot_data_ready(self, data):
         print("Plot data ready")
         self.ready_lb.config(bg="green")
-        Plotting.plot(self.mpl_ax, data)
-        self.canvas.draw()
+        self.dropdown.config(state="normal")
+        
+        if plots[self.drop_down_var.get()] == data.columns[0]:
+            Plotting.plot(self.mpl_ax, data)
+            self.canvas.draw()
 
 class Plotting:
     @staticmethod
@@ -189,13 +207,17 @@ class Model:
         self.data = pd.DataFrame()
         self.country_codes = pd.read_csv("country_codes_simple_fixed.csv", na_filter = False)
     
+    def res_usage(self):
+        proc = psutil.Process(os.getpid())
+        return f"Ram : {round(proc.memory_info()[0]/(1024*1024), 1)} MB |"
+        
     def loading_done(self, *args):
         self.iface.file_loaded_cb()
         
         print("Loading finished !")
         
     def load_main_file_async(self, filename, pg_val=None): 
-        thread = threading.Thread(target=lambda :self._load_file(filename, pg_val)) # Could use args parameter
+        thread = threading.Thread(target=self._load_file, args=(filename, pg_val))
         thread.daemon = True
         thread.start()
     
@@ -206,8 +228,9 @@ class Model:
         i = 1
         tmp = []
         
-        for df in tqdm(pd.read_json(filepath, lines=True, chunksize=CHUNK_SIZE), total=line_count(filepath)/CHUNK_SIZE): 
-            df = df.loc[df['event_type'] == 'read']
+        for df in tqdm(pd.read_json(filepath, lines=True, chunksize=CHUNK_SIZE), total=int(line_count(filepath)/CHUNK_SIZE)+1): 
+            df = df.loc[df['event_type'].isin(['read', 'pageread'])] # Since we are working with a random sample, some read documents don't have the "read" record but have "pageread" records
+            
             tmp.append(df[['visitor_uuid','visitor_country', 'visitor_useragent', 'subject_doc_id']])  
             if self.tk_gui and pg_val is not None:
                 pg_val.set(i)
@@ -230,22 +253,17 @@ class Model:
             return continent_list[0]
         else:
             return 'None'
-            
-    
-    
+
         
-    def get_plot_data(self, var, doc_id = None, callback=None):
-        #if not self.tk_gui:
-        #    self.add_column(var, blocking=True)
-        #else:
-        #    if self.add_column(var, blocking=False, callback=self.ttt):
-        #self.add_column(var, blocking=False, callback=self.col_ready)
-        self.preprocess(var)
-           
+    def get_plot_data(self, var, doc_id = None, callback=None): # From gui -> Running in seperate thread, get data back with callback. From Cli, just run without callback
+
+        if var not in self.data.columns:
+            self.preprocess(var)
+            
         data = self.data.copy()  ### TODO : Find a way to not use it
         
         if doc_id is not None: # If we are making a plot for a given document or a on the whole dataset
-            data.loc[data['subject_doc_id'] == doc_id]#data.iloc[doc_id]['subject_doc_id']] #'130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb'] '130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb']
+            data = data.loc[data['subject_doc_id'] == doc_id]#data.iloc[doc_id]['subject_doc_id']] #'130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb'] '130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb']
         
         data.drop_duplicates(['visitor_uuid'], inplace=True)
         assert(data is not self.data)
@@ -255,11 +273,8 @@ class Model:
         
         if callback is not None:
             callback(data)
-
-    #def add_column(self, var, blocking=False, callback=None):
-    #    if var not in list(self.data.columns):
-    #        thread = threading.Thread(target=self.preprocess, args=(var,callback)) 
-    #        thread.start()
+        else:
+            return data
             
     def preprocess(self, var):
         start_time = time.time() 
@@ -270,7 +285,7 @@ class Model:
            
         # TODO : use tqdm here
         self.data[var] = np.nan
-        for df, i in tqdm(zip(split, range(1,101))):
+        for df, i in tqdm(zip(split, range(1,101)), total=100):
             if var == 'visitor_browser':
                 self._preprocess_browser(df)
             elif var == 'visitor_platform':
@@ -310,11 +325,13 @@ class Model:
         also_readers = self.get_document_readers(doc_id)
         print(f"readers of the same doc : {also_readers}")
        
-        if ori_reader:
+        if ori_reader is not None:
             also_readers.remove(ori_reader)  
         
         dic[doc_id] = []
-        dic[doc_id].append(ori_reader)
+        
+        if ori_reader is not None:
+            dic[doc_id].append(ori_reader)
                    
         for reader in also_readers:
             good = False
@@ -343,8 +360,6 @@ class Model:
         
         print(f"Time : {time.time() - start} sec")
         
-        print (dic)
-
         return dic
 
 class GraphBuilder:
@@ -361,9 +376,9 @@ class GraphBuilder:
         self.graph = Graph(graph_header, ori_design="style=filled,color=\".3 .9 .7\"")
        
     def build_tree(self, ori_doc, dic, ori_reader=None):
- 
+        
         ori_doc = ori_doc[-4:]
-        if ori_reader:
+        if ori_reader is not None:
             ori_reader = ori_reader[-4:]
     
         n = {}
@@ -371,17 +386,14 @@ class GraphBuilder:
             n[d[-4:]] = []
             for reader in readers:
                 n[d[-4:]].append(reader[-4:])
-                
-        #dic = {d[-4:]: v[-4:] for d, v in dic.items()}
-        
+
         self.add_ori(ori_doc, ori_reader)
         self.add_other_docs(set(n.keys()))
         self.add_other_readers(set(chain.from_iterable(n.values())))
         
         if ori_reader:
             self.add_link(ori_reader, ori_doc)
-        
-        #import pdb; pdb.set_trace()
+
         for doc, readers in n.items():
             for reader in readers:
                 self.add_link(reader, doc)
@@ -516,33 +528,150 @@ def arg_parser():
     parser.add_argument("-u", "--user_uuid", action="store",\
                         help='Issuu compliant input data file')
 
-    gui_group.add_argument("-plt", action="store_true",\
+    parser.add_argument("-s", "--sort", action="store",\
+                        choices=['freq_asc','freq_desc','biaised'],
+                        help='Also likes document sort algorithm')
+                        
+    gui_group.add_argument("--plt", action="store_true",\
                         help='Show plots (without gui)')
 
     return parser
 
-class Cli:
+class Cli:    
+    def __init__(self):
+         self.dispatch = {'2a' : self.task2a,
+                          '2b' : self.task2b,
+                          '3a' : self.task3a,
+                          '3b' : self.task3b,
+                          '4d' : self.task4d,
+                          '5'  : self.task5,
+                          'platform': self.task_platform}
+                    
     def load_main_file(self, filename):
         self.model._load_file(filename)
-        
+    
     def set_model(self, model):
         self.model = model
+            
+    def get_plot_data(self, var, doc_id=None):
+        return self.model.get_plot_data(var, doc_id)
+
+    def get_doc(self):
+        doc_id = args.doc_uuid
+        if doc_id == 'random':
+            return self.model.data.iloc[random.randrange(0,len(self.model.data))]['subject_doc_id']
+        
+        elif doc_id is not None and doc_id[12] != '-' and len(doc) != 45:
+            return "Invalid document id !"
+            
+        else:
+            return doc_id        
     
-    def get_plot_data(self, var, doc_id):
-        return self.model.get_plot_data(var, doc_id)#.to_string(index=False)
+    def get_user(self):
+        user_id = args.user_uuid
+        
+        if user_id == 'random':
+            return self.model.data.iloc[random.randrange(0, len(self.model.data))]['visitor_uuid']
+            
+        elif user_id is not None and len(user_id) != 16:
+            return "Invalid user id !"
+            
+        else:
+            return user_id
+     
+    def get_sort(self):
+        sorting_algo = {'freq_desc': Sorting.freq_descending_sort,
+                'freq_asc' : Sorting.freq_ascending_sort,
+                'biased'   : Sorting.biased_sort,
+                None       : Sorting.freq_ascending_sort}
+                
+        sort = args.sort
+        algo = sorting_algo.get(args.sort)
+        
+        if algo == 'None' and not args.quiet:
+            print("Sorting algorithm not provided, using default 'freq_desc'")
+            algo = sorting_algo.get('freq_desc') 
+        
+        return algo
+        
+    def task2a(self):
+        doc = self.get_doc()
+        data = self.get_plot_data('visitor_country', doc)
+        self.output(data)
+        
+    def task2b(self):
+        doc = self.get_doc() 
+        data = self.get_plot_data('visitor_continent', doc)
+        self.output(data)
+        
+    def task3a(self):
+        data = self.get_plot_data('visitor_useragent')
+        self.output(data)
+    
+    def task3b(self):
+        data = self.get_plot_data('visitor_browser')
+        self.output(data)
+    
+    def task4d(self):
+        doc = self.get_doc()
+        user = self.get_user()
+        sort = self.get_sort()
+        data = list(self.model.also_likes(doc, sort, user).keys())
+        self.output(data)
+
+    def task5(self, **kwargs):
+        doc = self.get_doc()
+        user = self.get_user()
+        sort = self.get_sort()
+        data = self.model.also_likes(doc, sort, user)
+        self.output(data)
+    
+    def task_platform(self):
+        doc = self.get_doc()
+        data = self.get_plot_data('visitor_platform', doc)
+        self.output(data)
+    
+    def output(self, data):
+        if not args.quiet:
+            print(data)
+        
+        if args.plt:
+            self.plot(data)
+            
+    def plot(self, data):
+        if args.task_id not in ('4d', '5'):
+            ax = plt.gca()
+            Plotting.plot(ax, data)
+            plt.show()
+            input("Press a key to exit...")
+        
+        elif args.task_id == '5': 
+            run(["dot", "-Tpng", "-o my_diag.png", "my_diag.dot"])
+            import matplotlib.image as mpimg
+            img=mpimg.imread('my_diag.png')
+            plt.axis('off')
+            plt.imshow(img)
+            plt.subplots_adjust(bottom=0, top=1, left=0, right=1)
+            input("Press a key to exit...")
+            
+        elif args.task_id == '4d':
+            print("Flag --plt not available for task 4d - ignoring !")
+            
+    def execute_task(self, args):
+        self.args = args
+        self.load_main_file(args.input_file)
+        task_func = self.dispatch.get(args.task_id)
+        task_func()
         
 # Imports slow down cli - do something ?
 if __name__ == "__main__":
     parser = arg_parser()
     args = parser.parse_args()
 
-    v = args.verbose
     if not args.quiet:
-        verbosity = (v or 0) +1 # Equivalent to 'x if x else 0' (coalescing operator) - right hand side used if x = [0, None, False, ""]
+        verbosity = (args.verbose or 0) +1 # Equivalent to 'x if x else 0' (coalescing operator) - right hand side used if x = [0, None, False, ""]
     else:
-        verbosity = 0
-
-    print(verbosity)    
+        verbosity = 0  
     
     if args.gui:
         root = tk.Tk()
@@ -550,14 +679,22 @@ if __name__ == "__main__":
         da = DataAnalyser(iface=gui)
         root.mainloop()
     else:
-        required_no_gui = args.task_id is not None and args.doc_uuid is not None and args.task_id is not None 
+        required_no_gui = args.task_id is not None and args.task_id is not None 
 
         if not required_no_gui:
-            parser.error("the following arguments are required: -t/--task_id, -d/--doc_uuid, -f/--input_file when not using the gui (--gui)")
+            parser.error("the following arguments are required: -t/--task_id and -f/--input_file when not using the gui (--gui)")
 
         else:
+            if args.task_id != '4d' and args.sort is not None:
+                print("Ignoring sort algorithm selection - task is not '4d'")
+            
             cli = Cli()
+            if args.task_id not in list(cli.dispatch.keys()):
+                print("Invalid task !")
+                exit(-1)
+                
             da = DataAnalyser(iface=cli)
-            cli.load_main_file(args.input_file)
-            print(cli.get_plot_data('visitor_continent', '140206010823-b14c9d966be950314215c17923a04af7'))
-            input() 
+            cli.execute_task(args)
+
+            #logging.disable(logging.CRITICAL)
+            #logging.disable(logging.NOTSET)
