@@ -3,7 +3,7 @@ import pandas as pd
 import user_agents as ua
 
 import tkinter as tk
-from tkinter import filedialog, StringVar
+from tkinter import filedialog, StringVar, LEFT, BOTH
 from tkinter import ttk
 
 from itertools import takewhile, repeat, chain
@@ -20,11 +20,15 @@ import matplotlib.pyplot as plt
 import argparse
 import psutil
 import os
+import logging
+from logging import getLogger, StreamHandler
+
 
 style.use('ggplot')
 plt.ion()
 CHUNK_SIZE = 5000
 
+logger = None
 
 plots = {"None":"None",
          "Visitor country":"visitor_country",
@@ -35,41 +39,50 @@ plots = {"None":"None",
 if sys.platform == 'linux':
     from subprocess import run, PIPE
     def line_count(filename):
-        print("Counting lines in file (*nix)...")
+        logger.debug("Counting lines in file (*nix)...")
         lines = int(run(["wc", "-l", filename], stdout=PIPE).stdout.decode('utf-8').split(" ")[0])
-        print("Done")
+        logger.debug("Done")
         
         return lines
-else:   
+else:
+    logger.debug("Platform is not unix-like, file line counting will be (much) slower on large datasets")
     # Fastest pure python implementation found
     # Inspired by Quentin Pradet's answer at https://stackoverflow.com/questions/845058/how-to-get-line-count-cheaply-in-python (7th post)
     def line_count(filename):
-        print("Counting lines in file...")
+        logger.debug("Counting lines in file (crossplatform)...")
         fd = open(filename, 'rb')
         bufgen = takewhile(lambda x: x, (fd.raw.read(1024*1024) for _ in repeat(None)))
         lines = sum(buf.count(b'\n') for buf in bufgen)
         fd.close()
-        print("Done")
+        logger.debug("Done")
         
         return lines
 
 class Sorting:
     @staticmethod
     def freq_ascending_sort(data): # Data as : [('<DOC_ID>', <count>), ('<DOC_ID>', <count>)...], returns ['<DOC_ID>', '<DOC_ID>'...]
+        logger.debug("Sorting documents in ascending order")
         return data.reverse() # Data sorted (max -> min) by Counter
         
     @staticmethod 
     def freq_descending_sort(data):
+        logger.debug("Sorting documents in descending order")
         return data # Data already sorted (max -> min) by Counter
     
     @staticmethod
     def biased_sort(data): # Data : JSON encoded strings {"doc":"<DOC_ID>", "weight":"<weight>"} (1 per line)
         doc_weights = {}
-        with open("doc_weights.csv") as f:
-            for line in f.readlines():
-                (doc_id, weight) = line.split(',')
-                doc_weights[doc_id] = int(weight)
-                            
+        logger.debug("Sorting documents in descending order")
+        try: 
+            with open("doc_weights_boooom.csv") as f:
+                for line in f.readlines():
+                    (doc_id, weight) = line.split(',')
+                    doc_weights[doc_id] = int(weight)
+                    
+        except IOError:
+            logger.warning("Biased document weights file not found - using default sort (desc_sort)")
+            return self.freq_descending_sort(data)
+            
         sorted_docs = []
         
         for doc_id, freq in data:
@@ -81,45 +94,91 @@ class Sorting:
 
 class Gui:
     def __init__(self, root):
+        logger.debug("Tk GUI initialization")
         self.root = root
+        self.root.resizable(0,0)
         self.mainframe = ttk.Frame(self.root)
         self.mainframe.grid(column=2, row=4, sticky=("nswe"))
         self.mainframe.columnconfigure(0, weight=1)
         self.mainframe.rowconfigure(0, weight=1)
+        
+        self.create_input_widgets()
+        self.create_status_bar()
+        self.init_plot()
+        
+        
+   
+    def create_status_bar(self):
+        status_bar = tk.Frame(self.root)
+        status_bar.grid(column=1, row=100, columnspan=5,sticky='nswe')
+        self.res_usage = StringVar(self.root)
+        self.status_bar = tk.Label(status_bar, text="Ram usage : ", textvariable=self.res_usage)
+        self.status_bar.pack(side=LEFT, padx=10)
 
+        self.status_var = StringVar(self.root)
+        self.status_var.set("Waiting")
+        self.status_lb = tk.Label(status_bar, textvariable=self.status_var)
+        self.status_lb.pack(side=LEFT, fill=BOTH, padx=10, ipadx=15)
+        
+        self.pg_val = StringVar(self.root)
+        self.progressbar = ttk.Progressbar(status_bar, mode='determinate', variable=self.pg_val)#, length=300)
+        self.progressbar.pack(side=LEFT, padx=10, fill=BOTH, expand=1)
+ 
+        #self.pg2_val = StringVar(self.root)
+        #self.progressbar2 = ttk.Progressbar(status_bar, mode='determinate', variable=self.pg2_val)
+        #self.progressbar2.pack(side=LEFT)
+        
+        self.ready_lb = tk.Label(status_bar, text="Ready", bg="red")
+        self.ready_lb.pack(side=LEFT, padx=10)
+        
+        #status_bar.pack_propagate(0)
+        
+    def create_input_widgets(self):
         button = ttk.Button(self.root, text="Load data file", command=self.load_main_file)
         button.grid(column=1, row=1)
         
-        self.pg_val = StringVar(self.root)
-        self.progressbar = ttk.Progressbar(self.root, mode='determinate', variable=self.pg_val)
-        self.progressbar.grid(column=2, row=1, columnspan=2, sticky='nsew')
-
-        self.ready_lb = tk.Label(self.root, text="Ready", bg="red")
-        self.ready_lb.grid(column=4, row =1)
- 
-        self.drop_down_var = StringVar(self.root)
-        self.drop_down_var.set(list(plots.keys())[0]) # default value
-
-        self.dropdown = tk.OptionMenu(self.root, self.drop_down_var, *list(plots.keys()), command=lambda x :self.embed_plot(plots[x]))
-        self.dropdown.grid(column=3, row=3)
-        self.dropdown.config(state="disabled")
-   
-        self.mpl_ax = None
-        self.mpl_fig = None
-        self.show_graph()
+        doc_sel = ['Select one', 'Random document', 'All documents']
+        # Document selection mode
+        self.dp_doc_var = StringVar(self.root)
+        self.dp_doc_var.set(doc_sel[0])# default value
+        self.dp_doc_wg = tk.OptionMenu(self.root, self.dp_doc_var, *doc_sel, command=lambda x: self.txt_entry_doc.config(state="normal") if x == doc_sel[0] else self.txt_entry_doc.config(state="disabled"))
+        self.dp_doc_wg.grid(column=1, row=2)
         
-        self.pg2_val = StringVar(self.root)
-        self.progressbar2 = ttk.Progressbar(self.root, mode='determinate', variable=self.pg2_val)
-        self.progressbar2.grid(column=2, row=5, columnspan=2, sticky='nsew')
+        # Plot variable selection
+        self.dp_plt_var = StringVar(self.root)
+        self.dp_plt_var.set(list(plots.keys())[0]) # default value
+        self.dp_plt_wg = tk.OptionMenu(self.root, self.dp_plt_var, *list(plots.keys()), command=lambda x :self.embed_plot(plots[x]))
+        self.dp_plt_wg.grid(column=3, row=3)
+        self.dp_plt_wg.config(state="disabled")
         
-        button2 = ttk.Button(self.root, text="Get document readers", command=lambda : self.model.also_likes('140228202800-6ef39a241f35301a9a42cd0ed21e5fb0', Sorting.freq_descending_sort, 'b2a24f14bb5c9ea3'))#('232eeca785873d35')) 
-        button2.grid(column=5, row=3)
+        # Document id input
+        text_entry_default = "Enter a valid document id"
+        vcmd = (self.mainframe.register(self.doc_input_update),'%P')
+        self.txt_entry_doc = tk.Entry(self.root, width=42, validate="key", validatecommand=vcmd)
+        self.txt_entry_doc.insert(0, text_entry_default)
+        self.txt_entry_doc.bind('<FocusIn>', (lambda _: self.txt_entry_doc.delete(0, 'end') if self.txt_entry_doc.get() == text_entry_default else False))
+        self.txt_entry_doc.grid(column=2, row=2)
         
-        self.res_usage = StringVar(self.root)
-        self.status_bar = tk.Label(self.root, text="Ram usage : ", textvariable=self.res_usage)
-        self.status_bar.grid(column=1,row=100, sticky='nswe')
-   
-
+    
+    def doc_input_update(self, txt):
+        if check_doc_id(txt):
+            self.dp_plt_wg.config(state="normal")
+            self.txt_entry_doc.config(bg="pale green")
+            
+        else:
+            self.dp_plt_wg.config(state="disabled")
+            self.txt_entry_doc.config(bg="tomato")
+        
+        return True
+        
+    def also_likes(self, doc, sort, user):
+        self.mpl_fig.clf()
+        self.mpl_ax = self.mpl_fig.add_subplot(111)
+        graph = self.model.also_likes(doc, sort, user)
+        img = self.model.get_graph_img()
+        Plotting.show_graph_img(self.mpl_ax, img)
+        self.canvas.draw()
+        
     def refresh_res_label(self):
         self.res_usage.set(self.model.res_usage())
         self.root.after(1000, self.refresh_res_label)
@@ -134,15 +193,21 @@ class Gui:
     
     def file_loaded_cb(self):
         self.ready_lb.config(bg="green")
-        self.dropdown.config(state="normal")
-        
-    def load_main_file(self):
-        filename = filedialog.askopenfile().name
-        self.progressbar["maximum"] = int(line_count(filename) / CHUNK_SIZE)+1
-        self.model.load_main_file_async(filename, self.pg_val)
+        self.dp_plt_wg.config(state="normal")
+        self.status_var.set("Data file loaded")
     
-    def show_graph(self):
-        self.mpl_fig = Figure(figsize=(5,5), dpi=100)
+    def load_main_file(self):
+        filename = filedialog.askopenfile()
+        if filename is None:
+            return
+       
+        self.status_var.set("Loading data file")
+        lines = line_count(filename.name)
+        self.progressbar["maximum"] = int(lines / CHUNK_SIZE)+1
+        self.model.load_main_file_async({'filename':filename.name, 'linecount':lines}, self.pg_val)
+    
+    def init_plot(self):
+        self.mpl_fig = Figure(figsize=(7,7), dpi=100)
         self.mpl_ax = self.mpl_fig.add_subplot(111)
         
         c = tk.Frame(self.root)
@@ -160,28 +225,35 @@ class Gui:
         
         self.mpl_fig.clf()
         self.mpl_ax = self.mpl_fig.add_subplot(111)
-        if var != 'None':# self.model.data.columns: # TODO : Call back done -> show graph if still on same page
-            #if not self.model.get_plot_data(var, random.randrange(0,len(self.model.data)), callback=self.plot_data_ready): # Async, yield to say processing has to be done ?
+        if var != 'None':
              self.ready_lb.config(bg="red")
-             self.dropdown.config(state="disabled")
+             self.dp_plt_wg.config(state="disabled")
+             self.status_var.set("Preprocessing...")
              thread = threading.Thread(target=self.model.get_plot_data, args=(var,None, self.plot_data_ready)) # Thread creation is probably not worth it when preprocessing is already done
              thread.start() 
         else:
             self.canvas.draw()
           
     def plot_data_ready(self, data):
-        print("Plot data ready")
+        self.status_var.set("Preprocessing done")
+        logger.debug("Plot data ready")
         self.ready_lb.config(bg="green")
-        self.dropdown.config(state="normal")
+        self.dp_plt_wg.config(state="normal")
         
-        if plots[self.drop_down_var.get()] == data.columns[0]:
+        if plots[self.dp_plt_var.get()] == data.columns[0]:
             Plotting.plot(self.mpl_ax, data)
             self.canvas.draw()
 
+def check_doc_id(txt):
+    if len(txt) == 45 and txt[12] == '-' and all(letter in ['a','b','c','d','e','f','0','1','2','3','4','5','6','7','8','9','-'] for letter in txt):
+        return True
+    else:
+        return False
+ 
 class Plotting:
     @staticmethod
     def plot(axes, data):
-        print(f"ploting {data.columns[0]}")
+        logger.debug(f"Plotting {data.columns[0]}")
         
         # Bar plot chart       
         axes = data.plot.bar(data.columns[0],'counts', ax=axes)
@@ -192,6 +264,15 @@ class Plotting:
             
         # Rotate chart x ticks
         #self.mpl_fig.xticks(rotation=0)
+    
+    def show_graph_img(axes, img):
+        axes.axis('off')
+        axes.imshow(img)
+        axes.grid(False)
+        axes.set_xticks([])
+        axes.set_yticks([])
+        axes.yaxis.set_visible(False)
+        axes.xaxis.set_visible(False)
         
 class Model:
     def __init__(self, iface):
@@ -214,21 +295,19 @@ class Model:
     def loading_done(self, *args):
         self.iface.file_loaded_cb()
         
-        print("Loading finished !")
-        
-    def load_main_file_async(self, filename, pg_val=None): 
-        thread = threading.Thread(target=self._load_file, args=(filename, pg_val))
+    def load_main_file_async(self, file_dict, pg_val=None): 
+        thread = threading.Thread(target=self._load_file, args=(file_dict, pg_val))
         thread.daemon = True
         thread.start()
     
-    def _load_file(self, filepath, pg_val=None):
-        print("Started loading file")
+    def _load_file(self, file_dict, pg_val=None):
+        logger.info("Started loading file")
         self.data = pd.DataFrame()
         start_time = time.time()
         i = 1
         tmp = []
         
-        for df in tqdm(pd.read_json(filepath, lines=True, chunksize=CHUNK_SIZE), total=int(line_count(filepath)/CHUNK_SIZE)+1): 
+        for df in tqdm(pd.read_json(file_dict['filename'], lines=True, chunksize=CHUNK_SIZE), total=int(file_dict['linecount']/CHUNK_SIZE)+1): 
             df = df.loc[df['event_type'].isin(['read', 'pageread'])] # Since we are working with a random sample, some read documents don't have the "read" record but have "pageread" records
             
             tmp.append(df[['visitor_uuid','visitor_country', 'visitor_useragent', 'subject_doc_id']])  
@@ -242,9 +321,9 @@ class Model:
         if self.tk_gui and hasattr(self, 'done_loading') and isinstance(self.done_loading, StringVar):
             self.done_loading.set(True)
             
-        print("\nLoading done")
+        logger.info("Loading done")
         df_mem_usage = self.data.memory_usage().sum()/(1024*1024)
-        print(f"{time.time() - start_time} seconds, {df_mem_usage} MB")
+        logger.debug(f"Loaded in {round(time.time() - start_time, 2)} seconds - dataframe using {round(df_mem_usage, 2)} MB")
         
     def country_to_continent(self, country):
         continent_list = self.country_codes.loc[self.country_codes['a-2'] == country]['CC'].values
@@ -260,7 +339,7 @@ class Model:
         if var not in self.data.columns:
             self.preprocess(var)
             
-        data = self.data.copy()  ### TODO : Find a way to not use it
+        data = self.data.copy()
         
         if doc_id is not None: # If we are making a plot for a given document or a on the whole dataset
             data = data.loc[data['subject_doc_id'] == doc_id]#data.iloc[doc_id]['subject_doc_id']] #'130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb'] '130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb']
@@ -277,13 +356,14 @@ class Model:
             return data
             
     def preprocess(self, var):
+        logger.info(f"Starting preprocessing for {var}")
         start_time = time.time() 
+        
         if self.tk_gui and hasattr(self.iface, 'progressbar2'):
             self.iface.progressbar2["maximum"] = 100
             
         split = np.array_split(self.data, 100) # Data is not copied, no ram increase !
            
-        # TODO : use tqdm here
         self.data[var] = np.nan
         for df, i in tqdm(zip(split, range(1,101)), total=100):
             if var == 'visitor_browser':
@@ -294,10 +374,10 @@ class Model:
                 self._preprocess_continent(df)
                 
             if self.tk_gui:
-                self.iface.pg2_val.set(i)
+                self.iface.pg_val.set(i)
         self.data = pd.concat(split)
         
-        print(f"Done preprocessing - {time.time()- start_time} sec")
+        logger.info(f"Done preprocessing - {time.time()- start_time} sec")
 
                 
     def _preprocess_continent(self, df):
@@ -319,11 +399,13 @@ class Model:
         return data
      
     def also_likes(self, doc_id, sort, ori_reader = None):
+        logger.info("Starting 'also_likes' procedure")
         start = time.time()
+        
         dic = {}
-        print(f"Original reader : {ori_reader}, original doc : {doc_id}")
+        logger.debug(f"Original reader : {ori_reader}, original doc : {doc_id}")
         also_readers = self.get_document_readers(doc_id)
-        print(f"readers of the same doc : {also_readers}")
+        logger.debug(f"Readers of the same doc : {also_readers}")
        
         if ori_reader is not None:
             also_readers.remove(ori_reader)  
@@ -355,13 +437,22 @@ class Model:
 
         dot_graph = GraphBuilder().build_tree(doc_id, new_dic, ori_reader)
         
-        with open("my_diag.dot", "w") as f:
-            f.write(dot_graph)
+        self.save_graph(dot_graph)
         
-        print(f"Time : {time.time() - start} sec")
+        logger.debug(f"'also-likes' done - Time : {time.time() - start} sec")
         
-        return dic
+        return {'docs':dic.keys(), 'graph':dot_graph}
 
+    def save_graph(self, graph):
+        with open("my_diag.dot", "w") as f:
+            f.write(graph)
+
+    
+    def get_graph_img(self):
+        run(["dot", "-Tpng", "-o", "my_diag.png", "my_diag.dot"])
+        import matplotlib.image as mpimg
+        return mpimg.imread('my_diag.png')
+            
 class GraphBuilder:
     default_graph_header = ["digraph also_likes {",
                             "ranksep=.75; ratio=compress; size = \"15,22\"; orientation=landscape; rotate=180;",
@@ -529,7 +620,7 @@ def arg_parser():
                         help='Issuu compliant input data file')
 
     parser.add_argument("-s", "--sort", action="store",\
-                        choices=['freq_asc','freq_desc','biaised'],
+                        choices=['freq_asc','freq_desc','biased'],
                         help='Also likes document sort algorithm')
                         
     gui_group.add_argument("--plt", action="store_true",\
@@ -589,7 +680,7 @@ class Cli:
         algo = sorting_algo.get(args.sort)
         
         if algo == 'None' and not args.quiet:
-            print("Sorting algorithm not provided, using default 'freq_desc'")
+            logger.warning("Sorting algorithm not provided, using default 'freq_desc'")
             algo = sorting_algo.get('freq_desc') 
         
         return algo
@@ -616,25 +707,31 @@ class Cli:
         doc = self.get_doc()
         user = self.get_user()
         sort = self.get_sort()
-        data = list(self.model.also_likes(doc, sort, user).keys())
+        data = list(self.model.also_likes(doc, sort, user)['docs'])
         self.output(data)
 
     def task5(self, **kwargs):
         doc = self.get_doc()
         user = self.get_user()
         sort = self.get_sort()
-        data = self.model.also_likes(doc, sort, user)
+        data = self.model.also_likes(doc, sort, user)['graph']
         self.output(data)
     
     def task_platform(self):
         doc = self.get_doc()
         data = self.get_plot_data('visitor_platform', doc)
         self.output(data)
-    
+   
+    def to_string(self, data):
+        if isinstance(data, pd.DataFrame):
+            return data.to_string(index=False)
+        else:
+            return data
+            
     def output(self, data):
         if not args.quiet:
-            print(data)
-        
+            logger.results(f"\n\n========= TASK {args.task_id} =========\n {self.to_string(data)}")
+            
         if args.plt:
             self.plot(data)
             
@@ -642,36 +739,75 @@ class Cli:
         if args.task_id not in ('4d', '5'):
             ax = plt.gca()
             Plotting.plot(ax, data)
+            plt.text(200, 200, 'Image already saved')
             plt.show()
             input("Press a key to exit...")
         
-        elif args.task_id == '5': 
-            run(["dot", "-Tpng", "-o my_diag.png", "my_diag.dot"])
-            import matplotlib.image as mpimg
-            img=mpimg.imread('my_diag.png')
-            plt.axis('off')
-            plt.imshow(img)
-            plt.subplots_adjust(bottom=0, top=1, left=0, right=1)
+        elif args.task_id == '5':
+            img = self.model.get_graph_img()
+            fig = plt.figure(figsize=(6,6), dpi=100)
+            ax = fig.add_subplot(111)
+            Plotting.show_graph_img(self, ax, img)
+            fig.show()
+            fig.subplots_adjust(bottom=0, top=1, left=0, right=1)
+            #plt.annotate("Graph is already saved in file 'my_diag.png'", xy=(350,100), xytext=(10,10))
             input("Press a key to exit...")
             
         elif args.task_id == '4d':
-            print("Flag --plt not available for task 4d - ignoring !")
+            logger.warning("Flag --plt not available for task 4d - ignoring !")
             
     def execute_task(self, args):
         self.args = args
-        self.load_main_file(args.input_file)
+        self.load_main_file({'filename':args.input_file, 'linecount':line_count(args.input_file)})
         task_func = self.dispatch.get(args.task_id)
         task_func()
+
+
+def startLogging(level, log_file):
+        global logger 
+        logging.RESULTS = 25
+        logging.addLevelName(logging.RESULTS, "RESULTS")
         
+        logger = logging.getLogger(__name__)
+        setattr(logger, 'results', lambda msg, *args : logger._log(logging.RESULTS, msg, args))
+        
+        log_level = {0: 0,
+                     1: logging.RESULTS,
+                     2: logging.INFO,
+                     3: logging.DEBUG}
+             
+        logger.setLevel(log_level.get(level))
+        
+        stream_h = StreamHandler()        
+
+        if level != 1:
+            formatter = logging.Formatter('[%(levelname)s] : %(message)s')    
+            stream_h.setFormatter(formatter)
+            
+        if log_file is not None and os.access(os.path.dirname(log_file), os.W_OK):
+            file_h = logging.FileHandler(log_file)
+            logger.addHandler(file_h)
+            if level != 1:
+                file_h.setFormatter(formatter)
+
+        logger.addHandler(stream_h)
+
 # Imports slow down cli - do something ?
 if __name__ == "__main__":
     parser = arg_parser()
     args = parser.parse_args()
-
-    if not args.quiet:
-        verbosity = (args.verbose or 0) +1 # Equivalent to 'x if x else 0' (coalescing operator) - right hand side used if x = [0, None, False, ""]
-    else:
-        verbosity = 0  
+    
+    #if not args.quiet:
+    verbosity = min((args.verbose or 0) +1, 3) # Equivalent to 'x if x else 0' (coalescing operator) - right hand side used if x = [0, None, False, ""]
+    #else:
+    #    verbosity = 0    
+    
+    if verbosity < 2:
+        def tqdm(x, total): # Override tqdm progress bar
+            return x
+            
+    
+    startLogging(verbosity, args.output_file)
     
     if args.gui:
         root = tk.Tk()
@@ -679,7 +815,7 @@ if __name__ == "__main__":
         da = DataAnalyser(iface=gui)
         root.mainloop()
     else:
-        required_no_gui = args.task_id is not None and args.task_id is not None 
+        required_no_gui = args.task_id is not None and args.input_file is not None 
 
         if not required_no_gui:
             parser.error("the following arguments are required: -t/--task_id and -f/--input_file when not using the gui (--gui)")
