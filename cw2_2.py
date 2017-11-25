@@ -3,7 +3,7 @@ import pandas as pd
 import user_agents as ua
 
 import tkinter as tk
-from tkinter import filedialog, StringVar, LEFT, BOTH
+from tkinter import filedialog, StringVar, LEFT, BOTH, END
 from tkinter import ttk
 
 from itertools import takewhile, repeat, chain
@@ -22,6 +22,7 @@ import psutil
 import os
 import logging
 from logging import getLogger, StreamHandler
+from math import ceil
 
 
 style.use('ggplot')
@@ -34,7 +35,8 @@ plots = {"None":"None",
          "Visitor country":"visitor_country",
          "Visitor continent":"visitor_continent",
          "Visitor browser":"visitor_browser",
-         "Visitor platform":"visitor_platform"}
+         "Visitor platform":"visitor_platform",
+         "Also likes diagram":"also_likes"}
 
 if sys.platform == 'linux':
     from subprocess import run, PIPE
@@ -123,55 +125,96 @@ class Gui:
         self.pg_val = StringVar(self.root)
         self.progressbar = ttk.Progressbar(status_bar, mode='determinate', variable=self.pg_val)#, length=300)
         self.progressbar.pack(side=LEFT, padx=10, fill=BOTH, expand=1)
- 
-        #self.pg2_val = StringVar(self.root)
-        #self.progressbar2 = ttk.Progressbar(status_bar, mode='determinate', variable=self.pg2_val)
-        #self.progressbar2.pack(side=LEFT)
         
         self.ready_lb = tk.Label(status_bar, text="Ready", bg="red")
         self.ready_lb.pack(side=LEFT, padx=10)
         
         #status_bar.pack_propagate(0)
-        
+     
     def create_input_widgets(self):
         button = ttk.Button(self.root, text="Load data file", command=self.load_main_file)
         button.grid(column=1, row=1)
         
-        doc_sel = ['Select one', 'Random document', 'All documents']
+        doc_sel = ['Select one', 'All documents']
         # Document selection mode
         self.dp_doc_var = StringVar(self.root)
         self.dp_doc_var.set(doc_sel[0])# default value
-        self.dp_doc_wg = tk.OptionMenu(self.root, self.dp_doc_var, *doc_sel, command=lambda x: self.txt_entry_doc.config(state="normal") if x == doc_sel[0] else self.txt_entry_doc.config(state="disabled"))
-        self.dp_doc_wg.grid(column=1, row=2)
+        self.dp_doc_wg = tk.OptionMenu(self.root, self.dp_doc_var, *doc_sel, command=lambda x: self.dp_doc_sel_update(x))
+        self.dp_doc_wg.config(width=max(map(len,doc_sel)) - 5)
+        self.dp_doc_wg.grid(column=1, row=2, sticky='ew')
         
         # Plot variable selection
         self.dp_plt_var = StringVar(self.root)
         self.dp_plt_var.set(list(plots.keys())[0]) # default value
-        self.dp_plt_wg = tk.OptionMenu(self.root, self.dp_plt_var, *list(plots.keys()), command=lambda x :self.embed_plot(plots[x]))
-        self.dp_plt_wg.grid(column=3, row=3)
+        self.dp_plt_wg = tk.OptionMenu(self.root, self.dp_plt_var, *list(plots.keys()), command=lambda x :self.show_plot_graph(plots[x], self.get_doc_id()))
+        self.dp_plt_wg.grid(column=2, row=3)
         self.dp_plt_wg.config(state="disabled")
         
         # Document id input
-        text_entry_default = "Enter a valid document id"
-        vcmd = (self.mainframe.register(self.doc_input_update),'%P')
-        self.txt_entry_doc = tk.Entry(self.root, width=42, validate="key", validatecommand=vcmd)
-        self.txt_entry_doc.insert(0, text_entry_default)
-        self.txt_entry_doc.bind('<FocusIn>', (lambda _: self.txt_entry_doc.delete(0, 'end') if self.txt_entry_doc.get() == text_entry_default else False))
+        self.text_entry_default = "Enter a valid document id"
+        vcmd = (self.mainframe.register(self.doc_input_update),'%P', '%d')
+        self.txt_entry_doc = tk.Entry(self.root, width=43, validate="key", validatecommand=vcmd)
+        self.txt_entry_doc.insert(0, self.text_entry_default)
+        self.txt_entry_doc.bind('<FocusIn>', (lambda _: self.txt_entry_doc.delete(0, 'end') if self.txt_entry_doc.get() == self.text_entry_default else False))
         self.txt_entry_doc.grid(column=2, row=2)
         
-    
-    def doc_input_update(self, txt):
-        if check_doc_id(txt):
+        self.rnd_doc_btn = ttk.Button(self.root, text="Random document", command=self.set_rnd_doc)
+        self.rnd_doc_btn.grid(column=5, row=2)
+        self.rnd_doc_btn.config(state="disabled")
+     
+    def show_plot_graph(self, var, doc=None):
+        if var != 'None' and var != "also_likes":
+            self.embed_plot(var, doc)
+        elif var == 'also_likes':
+            self.also_likes(doc, Sorting.freq_descending_sort, user=None)
+        else:
+            Plotting.reset_plot(self.mpl_ax)
+            self.canvas.draw()
+            
+    def dp_doc_sel_update(self, dp_val):
+        if dp_val == 'Select one':
+            self.txt_entry_doc.config(state="normal")  
+            self.rnd_doc_btn.config(state="normal")
+            self.doc_input_update(self.get_doc_id(), 1)
+            self.dp_plt_wg['menu'].add_command(label='Also likes diagram', command=tk._setit(self.dp_plt_var, 'Also likes diagram'))
+
+        else :
+            self.txt_entry_doc.config(state="disabled")
+            self.rnd_doc_btn.config(state="disabled")
+            self.dp_plt_wg.config(state="normal") 
+            if self.dp_plt_var.get() == 'Also likes diagram':
+                self.dp_plt_var.set('None')
+                self.show_plot_graph('None')
+                
+            self.dp_plt_wg['menu'].delete('Also likes diagram')
+            self.show_plot_graph(plots[self.dp_plt_var.get()]) # All documents
+            
+    def doc_input_update(self, txt, action): 
+        if check_doc_id(txt) and 'subject_doc_id' in self.model.data.columns and txt in self.model.data['subject_doc_id'].tolist(): # test cases order important - better performance and expression evaluated before model is set on startup, but check_doc_id will be false on start 
             self.dp_plt_wg.config(state="normal")
             self.txt_entry_doc.config(bg="pale green")
+            if action != 0: # Not delete
+                self.show_plot_graph(plots[self.dp_plt_var.get()], txt)
             
-        else:
+        elif txt != self.text_entry_default:
             self.dp_plt_wg.config(state="disabled")
             self.txt_entry_doc.config(bg="tomato")
         
         return True
+    
+    def set_rnd_doc(self):
+        rnd = random.randrange(0,len(self.model.data))
+        self.txt_entry_doc.delete(0, END)
+        self.txt_entry_doc.insert(0, self.model.data.iloc[rnd]['subject_doc_id'])
+            
+    def get_doc_id(self):
+        if self.dp_doc_var.get() == 'All documents':
+            return None
+            
+        else:
+            return self.txt_entry_doc.get()
         
-    def also_likes(self, doc, sort, user):
+    def also_likes(self, doc, sort, user=None):
         self.mpl_fig.clf()
         self.mpl_ax = self.mpl_fig.add_subplot(111)
         graph = self.model.also_likes(doc, sort, user)
@@ -193,8 +236,10 @@ class Gui:
     
     def file_loaded_cb(self):
         self.ready_lb.config(bg="green")
-        self.dp_plt_wg.config(state="normal")
         self.status_var.set("Data file loaded")
+        self.rnd_doc_btn.config(state="normal")
+        if self.dp_doc_var.get() == 'Select one':
+            self.doc_input_update(self.txt_entry_doc.get(), 1) # Forced doc check
     
     def load_main_file(self):
         filename = filedialog.askopenfile()
@@ -203,7 +248,7 @@ class Gui:
        
         self.status_var.set("Loading data file")
         lines = line_count(filename.name)
-        self.progressbar["maximum"] = int(lines / CHUNK_SIZE)+1
+        self.progressbar["maximum"] = ceil(lines / CHUNK_SIZE) # int(X) + 1 doesn't work for whole values
         self.model.load_main_file_async({'filename':filename.name, 'linecount':lines}, self.pg_val)
     
     def init_plot(self):
@@ -220,16 +265,15 @@ class Gui:
         toolbar = NavigationToolbar2TkAgg(self.canvas, c)
         toolbar.update()
       
-    def embed_plot(self, var):
-        threshold = 0
+    def embed_plot(self, var, doc_id):
+        threshold = 0 # TODO 
         
-        self.mpl_fig.clf()
-        self.mpl_ax = self.mpl_fig.add_subplot(111)
+        Plotting.reset_plot(self.mpl_ax)
         if var != 'None':
              self.ready_lb.config(bg="red")
              self.dp_plt_wg.config(state="disabled")
              self.status_var.set("Preprocessing...")
-             thread = threading.Thread(target=self.model.get_plot_data, args=(var,None, self.plot_data_ready)) # Thread creation is probably not worth it when preprocessing is already done
+             thread = threading.Thread(target=self.model.get_plot_data, args=(var, doc_id, self.plot_data_ready)) # Thread creation is probably not worth it when preprocessing is already done
              thread.start() 
         else:
             self.canvas.draw()
@@ -239,10 +283,8 @@ class Gui:
         logger.debug("Plot data ready")
         self.ready_lb.config(bg="green")
         self.dp_plt_wg.config(state="normal")
-        
-        if plots[self.dp_plt_var.get()] == data.columns[0]:
-            Plotting.plot(self.mpl_ax, data)
-            self.canvas.draw()
+        Plotting.plot(self.mpl_ax, data)
+        self.canvas.draw()
 
 def check_doc_id(txt):
     if len(txt) == 45 and txt[12] == '-' and all(letter in ['a','b','c','d','e','f','0','1','2','3','4','5','6','7','8','9','-'] for letter in txt):
@@ -269,10 +311,15 @@ class Plotting:
         axes.axis('off')
         axes.imshow(img)
         axes.grid(False)
-        axes.set_xticks([])
-        axes.set_yticks([])
         axes.yaxis.set_visible(False)
         axes.xaxis.set_visible(False)
+     
+    def reset_plot(axes):
+        axes.axis('on')
+        axes.grid(True)
+        axes.yaxis.set_visible(True)
+        axes.xaxis.set_visible(True)
+        axes.cla()
         
 class Model:
     def __init__(self, iface):
@@ -302,18 +349,19 @@ class Model:
     
     def _load_file(self, file_dict, pg_val=None):
         logger.info("Started loading file")
-        self.data = pd.DataFrame()
         start_time = time.time()
-        i = 1
+        
         tmp = []
         
-        for df in tqdm(pd.read_json(file_dict['filename'], lines=True, chunksize=CHUNK_SIZE), total=int(file_dict['linecount']/CHUNK_SIZE)+1): 
+        pd_reader = pd.read_json(file_dict['filename'], lines=True, chunksize=CHUNK_SIZE)
+        loop_count = ceil(file_dict['linecount']/CHUNK_SIZE)
+        
+        for i, df in tqdm(enumerate(pd_reader), total=loop_count): 
             df = df.loc[df['event_type'].isin(['read', 'pageread'])] # Since we are working with a random sample, some read documents don't have the "read" record but have "pageread" records
             
             tmp.append(df[['visitor_uuid','visitor_country', 'visitor_useragent', 'subject_doc_id']])  
             if self.tk_gui and pg_val is not None:
-                pg_val.set(i)
-            i +=1
+                pg_val.set(i+1)
         
         self.data = pd.concat(tmp, axis=0)
         self.data.drop_duplicates(['visitor_uuid', 'subject_doc_id'], inplace=True)
@@ -340,14 +388,14 @@ class Model:
             self.preprocess(var)
             
         data = self.data.copy()
-        
         if doc_id is not None: # If we are making a plot for a given document or a on the whole dataset
             data = data.loc[data['subject_doc_id'] == doc_id]#data.iloc[doc_id]['subject_doc_id']] #'130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb'] '130705172251-3a2a725b2bbd5aa3f2af810acf0aeabb']
         
         data.drop_duplicates(['visitor_uuid'], inplace=True)
-        assert(data is not self.data)
+        
         # Get sum on the given column and sort in descending order
         data = data.groupby([var], as_index=False).size().reset_index(name='counts')
+        
         data = data.sort_values('counts', ascending=False)
         
         if callback is not None:
@@ -359,13 +407,13 @@ class Model:
         logger.info(f"Starting preprocessing for {var}")
         start_time = time.time() 
         
-        if self.tk_gui and hasattr(self.iface, 'progressbar2'):
-            self.iface.progressbar2["maximum"] = 100
+        if self.tk_gui and hasattr(self.iface, 'progressbar'):
+            self.iface.progressbar["maximum"] = 100
             
         split = np.array_split(self.data, 100) # Data is not copied, no ram increase !
            
         self.data[var] = np.nan
-        for df, i in tqdm(zip(split, range(1,101)), total=100):
+        for i, df in tqdm(enumerate(split), total=100):
             if var == 'visitor_browser':
                 self._preprocess_browser(df)
             elif var == 'visitor_platform':
@@ -374,9 +422,9 @@ class Model:
                 self._preprocess_continent(df)
                 
             if self.tk_gui:
-                self.iface.pg_val.set(i)
-        self.data = pd.concat(split)
+                self.iface.pg_val.set(i+1)
         
+        self.data = pd.concat(split)
         logger.info(f"Done preprocessing - {time.time()- start_time} sec")
 
                 
@@ -426,7 +474,6 @@ class Model:
             
             if good:
                 dic[doc_id].append(reader)
-           #docs.extend((reader, self.visitor_views(reader)))
         
         tmp = [(doc_id, len(readers)) for doc_id, readers in dic.items()]
         sorted(tmp, key=lambda x:x[1])
@@ -797,16 +844,12 @@ if __name__ == "__main__":
     parser = arg_parser()
     args = parser.parse_args()
     
-    #if not args.quiet:
     verbosity = min((args.verbose or 0) +1, 3) # Equivalent to 'x if x else 0' (coalescing operator) - right hand side used if x = [0, None, False, ""]
-    #else:
-    #    verbosity = 0    
-    
+
     if verbosity < 2:
-        def tqdm(x, total): # Override tqdm progress bar
+        def tqdm(x, total): # Override tqdm progress bar method in order to not show it
             return x
             
-    
     startLogging(verbosity, args.output_file)
     
     if args.gui:
@@ -814,6 +857,7 @@ if __name__ == "__main__":
         gui = Gui(root)
         da = DataAnalyser(iface=gui)
         root.mainloop()
+        
     else:
         required_no_gui = args.task_id is not None and args.input_file is not None 
 
@@ -822,15 +866,12 @@ if __name__ == "__main__":
 
         else:
             if args.task_id != '4d' and args.sort is not None:
-                print("Ignoring sort algorithm selection - task is not '4d'")
+                logging.info("Ignoring sort algorithm selection - task is not '4d'")
             
             cli = Cli()
             if args.task_id not in list(cli.dispatch.keys()):
-                print("Invalid task !")
+                logging.critical("Invalid task !")
                 exit(-1)
                 
             da = DataAnalyser(iface=cli)
             cli.execute_task(args)
-
-            #logging.disable(logging.CRITICAL)
-            #logging.disable(logging.NOTSET)
