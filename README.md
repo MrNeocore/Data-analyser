@@ -1,4 +1,4 @@
-# Python-data-analyser
+# Data-analyser
 Data analyser for Issuu data
 
 ## Context :
